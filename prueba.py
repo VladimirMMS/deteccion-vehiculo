@@ -1,129 +1,88 @@
-import argparse
-from pathlib import Path
-import time
-
+# -*- coding: utf-8 -*-
 import cv2
-import supervision as sv
-from inference import get_model
+import torch
+from time import sleep
 
-# ---------- Helpers ----------
-def is_camera_source(src: str) -> bool:
-    # "0", "1", etc. => webcam index
-    return src.isdigit()
+# ---- Config ----
+INFER_SIZE = 640
+PREFERRED_INDEXES = [1, 0, 2, 3]  # orden de prueba de índices
+TRY_BY_NAME = False               # pon True si conoces el nombre exacto del dispositivo
+DEVICE_NAME = "video=Integrated Camera"  # ejemplo: "video=USB2.0 HD UVC WebCam"
 
-def build_label_texts(detections: sv.Detections, classes) -> list[str]:
-    labels = []
-    for cls_id, conf in zip(detections.class_id, detections.confidence):
-        name = classes.get(int(cls_id), f"id_{cls_id}")
-        labels.append(f"{name} {conf:.2f}")
-    return labels
+# ---- Carga modelo YOLOv5s (COCO) ----
+model = torch.hub.load(
+    'ultralytics/yolov5',
+    'yolov5s',
+    source='github',
+    trust_repo=True,
+    force_reload=False
+)
+model.conf = 0.25
+model.iou = 0.45
 
-# ---------- Image pipeline ----------
-def run_on_image(model, image_path: str, out_path: str | None):
-    image = cv2.imread(image_path)
-    if image is None:
-        raise FileNotFoundError(f"No se pudo leer la imagen: {image_path}")
+def try_open(index, backend):
+    cap = cv2.VideoCapture(index, backend)
+    if cap.isOpened():
+        # a veces isOpened es True pero read() falla; probamos un frame
+        ok, _ = cap.read()
+        if ok:
+            print(f"✅ Cámara abierta: index={index}, backend={backend}")
+            return cap
+        cap.release()
+    print(f"❌ No abre: index={index}, backend={backend}")
+    return None
 
-    # Inference
-    results = model.infer(image)[0]
-    detections = sv.Detections.from_inference(results)
+def open_any_camera():
+    # 1) Media Foundation primero (Windows moderno)
+    for idx in PREFERRED_INDEXES:
+        cap = try_open(idx, cv2.CAP_MSMF)
+        if cap: return cap
 
-    # Annotators
-    box_annotator = sv.BoxAnnotator()
-    label_annotator = sv.LabelAnnotator()
+    # 2) DirectShow después
+    for idx in PREFERRED_INDEXES:
+        cap = try_open(idx, cv2.CAP_DSHOW)
+        if cap: return cap
 
-    labels = build_label_texts(detections, results.classes)
+    # 3) Por nombre (DirectShow) si lo habilitas y conoces el nombre exacto
+    if TRY_BY_NAME:
+        cap = cv2.VideoCapture(DEVICE_NAME, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            ok, _ = cap.read()
+            if ok:
+                print(f"✅ Cámara por nombre: {DEVICE_NAME}")
+                return cap
+            cap.release()
+        print(f"❌ No abre por nombre: {DEVICE_NAME}")
 
-    annotated = box_annotator.annotate(scene=image.copy(), detections=detections)
-    annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
+    return None
 
-    # Mostrar
-    cv2.imshow("Vehicles - Image", annotated)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+cap = open_any_camera()
+if cap is None:
+    raise RuntimeError(
+        "No se pudo abrir ninguna cámara. Revisa:\n"
+        "• Permisos en Configuración > Privacidad y seguridad > Cámara\n"
+        "• Cierra apps que usen la cámara (Teams/Zoom/OBS/Discord)\n"
+        "• Prueba otros puertos USB o índices (0,1,2...)\n"
+        "• Actualiza controladores de la webcam"
+    )
 
-    if out_path:
-        cv2.imwrite(out_path, annotated)
-        print(f"✅ Imagen guardada en: {out_path}")
+# (opcional) fija resolución si tu cámara lo soporta
+# cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+# cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+sleep(0.1)  # pequeño delay
 
-# ---------- Video / Webcam pipeline ----------
-def run_on_stream(model, source: str, out_path: str | None):
-    cap = cv2.VideoCapture(int(source)) if is_camera_source(source) else cv2.VideoCapture(source)
-    if not cap.isOpened():
-        raise RuntimeError(f"No se pudo abrir la fuente: {source}")
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        print("⚠️ No se pudo leer frame (¿dispositivo desconectado?)")
+        break
 
-    # Preparar writer si se pide salida de video
-    writer = None
-    if out_path:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+    results = model(frame, size=INFER_SIZE)
+    annotated = results.render()[0]
+    cv2.imshow('YOLOv5 - Cámara', annotated)
 
-    box_annotator = sv.BoxAnnotator()
-    label_annotator = sv.LabelAnnotator()
+    if cv2.waitKey(5) & 0xFF == 27:  # ESC
+        break
 
-    t0 = time.time()
-    frames = 0
-
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-
-        results = model.infer(frame)[0]
-        detections = sv.Detections.from_inference(results)
-        labels = build_label_texts(detections, results.classes)
-
-        annotated = box_annotator.annotate(scene=frame, detections=detections)
-        annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
-
-        frames += 1
-        if frames % 10 == 0:
-            dt = time.time() - t0
-            fps = frames / dt if dt > 0 else 0
-            cv2.putText(annotated, f"FPS: {fps:.1f}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-        cv2.imshow("Vehicles - Stream", annotated)
-        if writer is not None:
-            writer.write(annotated)
-
-        if cv2.waitKey(1) & 0xFF == 27:  # ESC
-            break
-
-    cap.release()
-    if writer:
-        writer.release()
-        print(f"✅ Video guardado en: {out_path}")
-    cv2.destroyAllWindows()
-
-# ---------- Main ----------
-def main():
-    ap = argparse.ArgumentParser(description="Detección de vehículos con Roboflow Inference + Supervision")
-    ap.add_argument("--source", required=True,
-                    help="Ruta a imagen/video o índice de webcam (e.g., 0)")
-    ap.add_argument("--model-id", default="vehicles-q0x2v/1",
-                    help="ID del modelo en Roboflow Inference (p.ej. 'vehicles-q0x2v/1')")
-    ap.add_argument("--out", default=None,
-                    help="Ruta de salida (imagen o video). Si omites, no guarda.")
-    args = ap.parse_args()
-
-    # Carga modelo (usa RF API key si el proyecto es privado)
-    model = get_model(model_id=args.model_id)
-
-    # Elegir pipeline según source
-    if Path(args.source).exists() and not is_camera_source(args.source):
-        # Si el path existe, distinguimos por extensión básica
-        ext = Path(args.source).suffix.lower()
-        if ext in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
-            run_on_image(model, args.source, args.out)
-        else:
-            run_on_stream(model, args.source, args.out)
-    else:
-        # Webcam u origen no-existente => intentar cámara
-        run_on_stream(model, args.source, args.out)
-
-if __name__ == "__main__":
-    main()
+cap.release()
+cv2.destroyAllWindows()
